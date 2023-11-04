@@ -601,7 +601,9 @@ dependencies = [
  "mediator",
  "mediator-tracing",
  "octocrab",
+ "serde",
  "serde_json",
+ "thiserror",
  "tokio",
  "tracing",
 ]
