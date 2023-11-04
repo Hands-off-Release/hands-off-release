@@ -1,7 +1,9 @@
 use anyhow::{bail, Context};
 use async_trait::async_trait;
+use config::{Config, ConfigError, File};
 use hor_registry::{GithubProject, Registry, SourceProject};
-use mediator::Mediate;
+use mediator::{ConfigParseErr, ConfigProvider, Mediate};
+use mediator_config::configrs::ConfigRsAdapter;
 use mediator_tracing::TracingModule;
 use octocrab::{
     models::repos::{Object, Ref},
@@ -12,9 +14,11 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::{info, info_span};
 
-type RefType<T> = Box<T>;
+pub type RefType<T> = Box<T>;
 
-pub struct UninitializedState {}
+pub struct UninitializedState {
+    config_provider: ConfigRsAdapter,
+}
 
 pub struct InitializedState {
     octo: Octocrab,
@@ -26,11 +30,31 @@ pub struct HorSystem<State> {
 }
 
 impl HorSystem<UninitializedState> {
-    pub fn new(registry: RefType<dyn Registry>) -> Self {
-        Self {
+    pub fn new(
+        registry: RefType<dyn Registry>,
+        config_path: &'static str,
+    ) -> Result<Self, HorSystemInitializationError> {
+        Ok(Self {
             registry,
-            state: UninitializedState {},
-        }
+            state: UninitializedState {
+                config_provider: ConfigRsAdapter(
+                    Config::builder()
+                        .add_source(File::with_name(config_path))
+                        .build()
+                        .map_err(|err| HorSystemInitializationError::ConfigRs(err))?,
+                ),
+            },
+        })
+    }
+
+    pub fn init(self) -> Result<HorSystem<InitializedState>, HorSystemInitializationError> {
+        TracingModule::default().init();
+        let config = self.state.config_provider.extract("hor");
+
+        let config: HorSystemConfiguration =
+            config.map_err(|err| HorSystemInitializationError::ConfigParse(err))?;
+
+        self.mediate(config)
     }
 }
 
@@ -131,6 +155,7 @@ impl HorSystem<InitializedState> {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct HorSystemConfiguration {
     github_personal_token: String,
 }
@@ -139,7 +164,6 @@ impl Mediate<HorSystemConfiguration> for HorSystem<UninitializedState> {
     type Out = Result<HorSystem<InitializedState>, HorSystemInitializationError>;
 
     fn mediate(self, config: HorSystemConfiguration) -> Self::Out {
-        TracingModule::default().init();
         Ok(HorSystem {
             registry: self.registry,
             state: InitializedState {
@@ -155,41 +179,12 @@ impl Mediate<HorSystemConfiguration> for HorSystem<UninitializedState> {
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 pub enum HorSystemInitializationError {
+    #[error("config.rs error")]
+    ConfigRs(#[source] ConfigError),
+    #[error("unable to parse configuration")]
+    ConfigParse(#[source] ConfigParseErr),
     #[error("an error occurred while initializing Octocrab")]
-    Octo(octocrab::Error),
-}
-
-#[cfg(test)]
-mod tests {
-    use hor_registry::{GithubProject, Registry, SourceProject, SourceProjects};
-    use mediator::Mediate;
-
-    use crate::{HorSystem, HorSystemConfiguration};
-
-    #[tokio::test]
-    async fn it_works() -> anyhow::Result<()> {
-        struct MockRegistry {
-            projects: SourceProjects,
-        }
-        impl Registry for MockRegistry {
-            fn get_projects(&self) -> &SourceProjects {
-                &self.projects
-            }
-        }
-
-        let system = HorSystem::new(Box::new(MockRegistry {
-            projects: vec![SourceProject::Github(GithubProject {
-                owner: "Hands-off-Release".to_string(),
-                repo: "hands-off-release".to_string(),
-                env: "deployment".to_string(),
-            })],
-        }))
-        .mediate(HorSystemConfiguration {
-            github_personal_token: String::new(),
-        })?;
-
-        system.sync().await
-    }
+    Octo(#[source] octocrab::Error),
 }
 
 #[async_trait]

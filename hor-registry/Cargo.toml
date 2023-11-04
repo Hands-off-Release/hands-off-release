@@ -8,3 +8,5 @@ edition = "2021"
 mediator-config = { workspace = true }
 derive_more = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+config = { workspace = true }

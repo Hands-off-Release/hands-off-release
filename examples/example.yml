@@ -1,0 +1,5 @@
+projects:
+  - github:
+      owner: Hands-off-Release
+      repo: hands-off-release
+      env: deployment

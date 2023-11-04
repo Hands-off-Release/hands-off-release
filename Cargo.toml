@@ -3,6 +3,17 @@ name = "hands-off-release"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+# Child crates
+hor-core = { path = "hor-core" }
+hor-registry = { path = "hor-registry" }
+
+# Workspace crates  
+anyhow = { workspace = true }
+
+# Other crates
+tokio = { version = "1.33.0", features = ["full"] }
+
 [workspace]
 members = ["hor-core", "hor-registry"]
 
@@ -15,3 +26,5 @@ mediator-tracing = { git = "ssh://git@github.com/JayJeyaruban/mediator.git" }
 derive_more = "0.99.17"
 serde = "1.0.189"
 thiserror = "1.0.50"
+anyhow = "1.0.75"
+config = { version = "0.13.3" }
