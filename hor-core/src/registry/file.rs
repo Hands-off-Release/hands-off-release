@@ -3,7 +3,7 @@ use derive_more::From;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::{Registry, SourceProjects};
+use super::{Registry, SourceProjects};
 
 pub struct FileBasedRegistry {
     source_projects: Box<SourceProjects>,

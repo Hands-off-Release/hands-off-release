@@ -1,4 +1,5 @@
 pub mod file;
+pub mod githubapp;
 
 use serde::{Deserialize, Serialize};
 

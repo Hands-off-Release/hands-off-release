@@ -1,58 +1,60 @@
+pub mod registry;
+
 use anyhow::{bail, Context};
 use async_trait::async_trait;
-use config::{Config, ConfigError, File};
-use hor_registry::{GithubProject, Registry, SourceProject};
+use config::ConfigError;
 use mediator::{ConfigParseErr, ConfigProvider, Mediate};
-use mediator_config::configrs::ConfigRsAdapter;
-use mediator_tracing::TracingModule;
 use octocrab::{
     models::repos::{Object, Ref},
     params::repos::Reference,
     GitHubError, Octocrab, OctocrabBuilder,
 };
+use registry::{GithubProject, Registry, SourceProject};
 use serde::Deserialize;
 use serde_json::json;
+use std::{convert::Infallible, future::Future, pin::Pin, sync::Arc};
+use tower::Service;
 use tracing::{info, info_span};
 
-pub type RefType<T> = Box<T>;
+pub type RefType<T> = Arc<T>;
 
-pub struct UninitializedState {
-    config_provider: ConfigRsAdapter,
+pub struct UninitializedState<CP> {
+    config_provider: CP,
 }
 
+#[derive(Clone)]
 pub struct InitializedState {
     octo: Octocrab,
 }
 
+#[derive(Clone)]
 pub struct HorSystem<State> {
-    registry: RefType<dyn Registry>,
+    registry: RefType<dyn Registry + Send + Sync>,
     state: State,
 }
 
-impl HorSystem<UninitializedState> {
+impl<CP: ConfigProvider> HorSystem<UninitializedState<CP>> {
     pub fn new(
-        registry: RefType<dyn Registry>,
-        config_path: &'static str,
+        registry: RefType<dyn Registry + Send + Sync>,
+        config_provider: CP,
     ) -> Result<Self, HorSystemInitializationError> {
         Ok(Self {
             registry,
-            state: UninitializedState {
-                config_provider: ConfigRsAdapter(
-                    Config::builder()
-                        .add_source(File::with_name(config_path))
-                        .build()
-                        .map_err(|err| HorSystemInitializationError::ConfigRs(err))?,
-                ),
-            },
+            state: UninitializedState { config_provider },
         })
     }
 
     pub fn init(self) -> Result<HorSystem<InitializedState>, HorSystemInitializationError> {
-        TracingModule::default().init();
+        // TracingModule::default().init();
         let config = self.state.config_provider.extract("hor");
 
-        let config: HorSystemConfiguration =
-            config.map_err(|err| HorSystemInitializationError::ConfigParse(err))?;
+        let config = match config {
+            Ok(config) => Some(config),
+            Err(err) => match err {
+                ConfigParseErr::NoKey => None,
+                err => return Err(HorSystemInitializationError::ConfigParse(err)),
+            },
+        };
 
         self.mediate(config)
     }
@@ -63,14 +65,16 @@ impl HorSystem<InitializedState> {
         let projects = self.registry.get_projects();
         for project in projects {
             match project {
-                SourceProject::Github(project) => self.update_github(project).await?,
+                SourceProject::Github(project) => {
+                    let git_ref = self.update_github(project).await?;
+                }
                 other => bail!("Project type currently not supported {:?}", other),
             }
         }
         Ok(())
     }
 
-    async fn update_github(&self, project: &GithubProject) -> anyhow::Result<()> {
+    async fn update_github(&self, project: &GithubProject) -> anyhow::Result<Ref> {
         let _span = info_span!("update Github project", ?project).entered();
         let owner = project.owner.as_str();
         let repo_path = project.repo.as_str();
@@ -86,9 +90,9 @@ impl HorSystem<InitializedState> {
             None => bail!("project does not have main branch defined"),
         })?;
 
-        let tag_sha = match repo_handler.get_ref(&Reference::Tag(env.to_string())).await {
+        let tag = match repo_handler.get_ref(&Reference::Tag(env.to_string())).await {
             Ok(tag) => match tag.object {
-                Object::Tag { sha, url: _ } => Some(sha),
+                Object::Tag { sha, .. } => Some(sha),
                 _ => bail!("unexpected ref type"),
             },
             Err(err) => match &err {
@@ -107,11 +111,11 @@ impl HorSystem<InitializedState> {
             format!("refs/tags/{env}")
         }
 
-        let _result = match tag_sha {
-            Some(tag_sha) => match tag_sha == tracked_branch_sha {
+        let result = match tag {
+            Some(tag) => match tag == tracked_branch_sha {
                 true => {
                     info!("Deployment already in appropriate spot");
-                    return Ok(());
+                    return Ok(todo!());
                 }
                 // Update ref
                 false => self
@@ -142,7 +146,7 @@ impl HorSystem<InitializedState> {
                 .context("Unable to create new ref"),
         }?;
 
-        Ok(())
+        Ok(result)
     }
 
     fn sha_for_ref(git_ref: Ref) -> anyhow::Result<String> {
@@ -160,19 +164,49 @@ pub struct HorSystemConfiguration {
     github_personal_token: String,
 }
 
-impl Mediate<HorSystemConfiguration> for HorSystem<UninitializedState> {
+impl<CP: ConfigProvider> Mediate<Option<HorSystemConfiguration>>
+    for HorSystem<UninitializedState<CP>>
+{
     type Out = Result<HorSystem<InitializedState>, HorSystemInitializationError>;
 
-    fn mediate(self, config: HorSystemConfiguration) -> Self::Out {
+    fn mediate(self, config: Option<HorSystemConfiguration>) -> Self::Out {
+        let mut octo = OctocrabBuilder::default();
+
+        if let Some(config) = config {
+            octo = octo.personal_token(config.github_personal_token);
+        }
+
+        let octo = octo.build()?;
+
         Ok(HorSystem {
             registry: self.registry,
-            state: InitializedState {
-                octo: OctocrabBuilder::default()
-                    .personal_token(config.github_personal_token)
-                    .build()
-                    .map_err(|err| HorSystemInitializationError::Octo(err))?,
-            },
+            state: InitializedState { octo },
         })
+    }
+}
+
+impl Service<hyper::Request<hyper::Body>> for HorSystem<InitializedState> {
+    type Response = hyper::Response<hyper::Body>;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + Sync>>;
+
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _: hyper::Request<hyper::Body>) -> Self::Future {
+        info!("This works");
+        let resp = hyper::Response::builder()
+            .status(204)
+            .body(hyper::Body::default())
+            .expect("Unable to create the `hyper::Response` object");
+
+        let fut = async { Ok(resp) };
+
+        Box::pin(fut)
     }
 }
 
@@ -185,6 +219,12 @@ pub enum HorSystemInitializationError {
     ConfigParse(#[source] ConfigParseErr),
     #[error("an error occurred while initializing Octocrab")]
     Octo(#[source] octocrab::Error),
+}
+
+impl From<octocrab::Error> for HorSystemInitializationError {
+    fn from(err: octocrab::Error) -> Self {
+        HorSystemInitializationError::Octo(err)
+    }
 }
 
 #[async_trait]
