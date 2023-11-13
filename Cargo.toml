@@ -28,3 +28,4 @@ serde = "1.0.189"
 thiserror = "1.0.50"
 anyhow = "1.0.75"
 config = { version = "0.13.3" }
+jsm = "0.1.0"

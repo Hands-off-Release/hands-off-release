@@ -17,8 +17,9 @@ pub type SourceProjects = Vec<SourceProject>;
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "kebab-case")]
-pub struct GithubProject {
-    pub owner: String,
-    pub repo: String,
-    pub env: String,
+#[jsm::public]
+struct GithubProject {
+    owner: String,
+    repo: String,
+    env: String,
 }
